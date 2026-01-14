@@ -5,6 +5,7 @@
 #include <locale.h>
 #include <ncurses.h>
 #include <poll.h>
+#include <pthread.h>  // NEW: for download thread
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -26,6 +27,9 @@
 #define CONFIG_DIR ".shellbeats"
 #define PLAYLISTS_DIR "playlists"
 #define PLAYLISTS_INDEX "playlists.json"
+#define CONFIG_FILE "config.json"  // NEW: config file name
+#define DOWNLOAD_QUEUE_FILE "download_queue.json"  // NEW: download queue file
+#define MAX_DOWNLOAD_QUEUE 1000  // NEW: max download queue size
 
 // ============================================================================
 // Data Structures
@@ -45,11 +49,50 @@ typedef struct {
     int count;
 } Playlist;
 
+// NEW: Configuration structure
+typedef struct {
+    char download_path[1024];
+} Config;
+
+// NEW: Download task status
+typedef enum {
+    DOWNLOAD_PENDING,
+    DOWNLOAD_ACTIVE,
+    DOWNLOAD_COMPLETED,
+    DOWNLOAD_FAILED
+} DownloadStatus;
+
+// NEW: Download task
+typedef struct {
+    char video_id[32];
+    char title[512];
+    char sanitized_filename[512];
+    char playlist_name[256];  // empty string if not from playlist
+    DownloadStatus status;
+} DownloadTask;
+
+// NEW: Download queue
+typedef struct {
+    DownloadTask tasks[MAX_DOWNLOAD_QUEUE];
+    int count;
+    int completed;
+    int failed;
+    int current_idx;  // currently downloading
+    bool active;      // thread is running
+    pthread_mutex_t mutex;
+    pthread_t thread;
+    bool thread_running;
+    bool should_stop;
+} DownloadQueue;
+
+// NEW: Added VIEW_SETTINGS, VIEW_ABOUT
 typedef enum {
     VIEW_SEARCH,
     VIEW_PLAYLISTS,
     VIEW_PLAYLIST_SONGS,
-    VIEW_ADD_TO_PLAYLIST
+    VIEW_ADD_TO_PLAYLIST,
+    VIEW_SETTINGS,
+    VIEW_ABOUT
 } ViewMode;
 
 typedef struct {
@@ -83,6 +126,12 @@ typedef struct {
     int add_to_playlist_scroll;
     Song *song_to_add;
     
+    // NEW: Settings UI state
+    int settings_selected;
+    bool settings_editing;
+    char settings_edit_buffer[1024];
+    int settings_edit_pos;
+    
     // Playback timing (to ignore false end events during loading)
     time_t playback_started;
     
@@ -90,6 +139,18 @@ typedef struct {
     char config_dir[1024];
     char playlists_dir[1024];
     char playlists_index[1024];
+    char config_file[1024];  // NEW
+    char download_queue_file[1024];  // NEW: download queue file path
+    
+    // NEW: Configuration
+    Config config;
+    
+    // NEW: Download queue
+    DownloadQueue download_queue;
+    
+    // NEW: Spinner state for download progress
+    int spinner_frame;
+    time_t last_spinner_update;
 } AppState;
 
 // ============================================================================
@@ -100,6 +161,9 @@ static pid_t mpv_pid = -1;
 static int mpv_ipc_fd = -1;
 static volatile sig_atomic_t got_sigchld = 0;
 
+// NEW: Global pointer for download thread access
+static AppState *g_app_state = NULL;
+
 // ============================================================================
 // Forward Declarations
 // ============================================================================
@@ -107,6 +171,10 @@ static volatile sig_atomic_t got_sigchld = 0;
 static void save_playlists_index(AppState *st);
 static void save_playlist(AppState *st, int idx);
 static void load_playlists(AppState *st);
+static void save_config(AppState *st);  // NEW
+static void load_config(AppState *st);  // NEW
+static void save_download_queue(AppState *st);  // NEW
+static void load_download_queue(AppState *st);  // NEW
 
 // ============================================================================
 // Utility Functions
@@ -130,6 +198,184 @@ static bool file_exists(const char *path) {
 static bool dir_exists(const char *path) {
     struct stat sb;
     return stat(path, &sb) == 0 && S_ISDIR(sb.st_mode);
+}
+
+// NEW: Create directory recursively (like mkdir -p)
+static bool mkdir_p(const char *path) {
+    char tmp[1024];
+    char *p = NULL;
+    size_t len;
+    
+    snprintf(tmp, sizeof(tmp), "%s", path);
+    len = strlen(tmp);
+    
+    if (tmp[len - 1] == '/') {
+        tmp[len - 1] = 0;
+    }
+    
+    for (p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = 0;
+            if (!dir_exists(tmp)) {
+                if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
+                    return false;
+                }
+            }
+            *p = '/';
+        }
+    }
+    
+    if (!dir_exists(tmp)) {
+        if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
+            return false;
+        }
+    }
+    
+    return true;
+}
+
+// NEW: Sanitize title for filename
+static void sanitize_title_for_filename(const char *title, const char *video_id, 
+                                         char *out, size_t out_size) {
+    if (!title || !video_id || !out || out_size < 32) {
+        if (out && out_size > 0) out[0] = '\0';
+        return;
+    }
+    
+    char sanitized[256] = {0};
+    size_t j = 0;
+    
+    for (size_t i = 0; title[i] && j < sizeof(sanitized) - 1; i++) {
+        char c = title[i];
+        
+        // Replace problematic characters
+        if (c == '/' || c == '\\' || c == ':' || c == '*' || 
+            c == '?' || c == '"' || c == '<' || c == '>' || c == '|') {
+            continue;
+        } else if (c == ' ' || c == '\'' || c == '`') {
+            if (j > 0 && sanitized[j-1] != '_') {
+                sanitized[j++] = '_';
+            }
+        } else if (isalnum((unsigned char)c) || c == '-' || c == '_' || c == '.' ||
+                   (unsigned char)c > 127) {  // Allow UTF-8
+            sanitized[j++] = c;
+        }
+    }
+    
+    // Remove trailing underscores
+    while (j > 0 && sanitized[j-1] == '_') {
+        j--;
+    }
+    sanitized[j] = '\0';
+    
+    // If empty after sanitization, use "download"
+    if (sanitized[0] == '\0') {
+        strcpy(sanitized, "download");
+    }
+    
+    // Truncate if too long (leave room for _[video_id].mp3)
+    if (strlen(sanitized) > 180) {
+        sanitized[180] = '\0';
+    }
+    
+    // Build final filename: Title_[video_id].mp3
+    snprintf(out, out_size, "%s_[%s].mp3", sanitized, video_id);
+}
+
+// NEW: Check if a file for this video_id exists in directory
+static bool file_exists_for_video(const char *dir_path, const char *video_id) {
+    DIR *dir = opendir(dir_path);
+    if (!dir) return false;
+    
+    char pattern[64];
+    snprintf(pattern, sizeof(pattern), "[%s].mp3", video_id);
+    
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strstr(entry->d_name, pattern) != NULL) {
+            closedir(dir);
+            return true;
+        }
+    }
+    
+    closedir(dir);
+    return false;
+}
+
+// Get the full path to a local file for a song in a playlist
+// Returns true if file exists and fills out_path, false otherwise
+static bool get_local_file_path_for_song(AppState *st, const char *playlist_name,
+                                          const char *video_id, char *out_path, size_t out_size) {
+    if (!video_id || !video_id[0] || !out_path || out_size == 0) return false;
+
+    char dest_dir[1024];
+    if (playlist_name && playlist_name[0]) {
+        snprintf(dest_dir, sizeof(dest_dir), "%s/%s", st->config.download_path, playlist_name);
+    } else {
+        snprintf(dest_dir, sizeof(dest_dir), "%s", st->config.download_path);
+    }
+
+    // Search for file with this video_id
+    DIR *dir = opendir(dest_dir);
+    if (!dir) return false;
+
+    char pattern[64];
+    snprintf(pattern, sizeof(pattern), "[%s].mp3", video_id);
+
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strstr(entry->d_name, pattern) != NULL) {
+            snprintf(out_path, out_size, "%s/%s", dest_dir, entry->d_name);
+            closedir(dir);
+            return true;
+        }
+    }
+
+    closedir(dir);
+    return false;
+}
+
+// Recursively delete a directory and all its contents
+static bool delete_directory_recursive(const char *path) {
+    DIR *dir = opendir(path);
+    if (!dir) return false;
+
+    struct dirent *entry;
+    char filepath[2048];
+    bool success = true;
+
+    while ((entry = readdir(dir)) != NULL) {
+        // Skip . and ..
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+
+        snprintf(filepath, sizeof(filepath), "%s/%s", path, entry->d_name);
+
+        struct stat st;
+        if (stat(filepath, &st) == 0) {
+            if (S_ISDIR(st.st_mode)) {
+                // Recursively delete subdirectory
+                if (!delete_directory_recursive(filepath)) {
+                    success = false;
+                }
+            } else {
+                // Delete file
+                if (unlink(filepath) != 0) {
+                    success = false;
+                }
+            }
+        }
+    }
+
+    closedir(dir);
+
+    // Delete the directory itself
+    if (rmdir(path) != 0) {
+        success = false;
+    }
+
+    return success;
 }
 
 static char *json_escape_string(const char *s) {
@@ -218,10 +464,14 @@ static bool init_config_dirs(AppState *st) {
     snprintf(st->config_dir, sizeof(st->config_dir), "%s/%s", home, CONFIG_DIR);
     snprintf(st->playlists_dir, sizeof(st->playlists_dir), "%s/%s", st->config_dir, PLAYLISTS_DIR);
     snprintf(st->playlists_index, sizeof(st->playlists_index), "%s/%s", st->config_dir, PLAYLISTS_INDEX);
+    snprintf(st->config_file, sizeof(st->config_file), "%s/%s", st->config_dir, CONFIG_FILE);  // NEW
+    snprintf(st->download_queue_file, sizeof(st->download_queue_file), "%s/%s", st->config_dir, DOWNLOAD_QUEUE_FILE);  // NEW
     
     st->config_dir[sizeof(st->config_dir) - 1] = '\0';
     st->playlists_dir[sizeof(st->playlists_dir) - 1] = '\0';
     st->playlists_index[sizeof(st->playlists_index) - 1] = '\0';
+    st->config_file[sizeof(st->config_file) - 1] = '\0';  // NEW
+    st->download_queue_file[sizeof(st->download_queue_file) - 1] = '\0';  // NEW
     
     // Create config directory if not exists
     if (!dir_exists(st->config_dir)) {
@@ -247,6 +497,403 @@ static bool init_config_dirs(AppState *st) {
     }
     
     return true;
+}
+
+// ============================================================================
+// NEW: Configuration Persistence
+// ============================================================================
+
+static void init_default_config(AppState *st) {
+    const char *home = getenv("HOME");
+    if (!home) home = "/tmp";
+    
+    // Default download path: ~/Music/shellbeats
+    snprintf(st->config.download_path, sizeof(st->config.download_path), 
+             "%s/Music/shellbeats", home);
+}
+
+static void save_config(AppState *st) {
+    FILE *f = fopen(st->config_file, "w");
+    if (!f) return;
+    
+    char *escaped_path = json_escape_string(st->config.download_path);
+    
+    fprintf(f, "{\n");
+    fprintf(f, "  \"download_path\": \"%s\"\n", escaped_path ? escaped_path : "");
+    fprintf(f, "}\n");
+    
+    free(escaped_path);
+    fclose(f);
+}
+
+static void load_config(AppState *st) {
+    // Set defaults first
+    init_default_config(st);
+    
+    FILE *f = fopen(st->config_file, "r");
+    if (!f) {
+        // No config file, save defaults
+        save_config(st);
+        return;
+    }
+    
+    // Read entire file
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    
+    if (fsize <= 0 || fsize > 64 * 1024) {
+        fclose(f);
+        return;
+    }
+    
+    char *content = malloc(fsize + 1);
+    if (!content) {
+        fclose(f);
+        return;
+    }
+    
+    size_t read_size = fread(content, 1, fsize, f);
+    content[read_size] = '\0';
+    fclose(f);
+    
+    // Parse download_path
+    char *download_path = json_get_string(content, "download_path");
+    if (download_path && download_path[0]) {
+        strncpy(st->config.download_path, download_path, sizeof(st->config.download_path) - 1);
+        st->config.download_path[sizeof(st->config.download_path) - 1] = '\0';
+    }
+    free(download_path);
+    
+    free(content);
+}
+
+// ============================================================================
+// NEW: Download Queue Persistence
+// ============================================================================
+
+// NOTE: Must be called with download_queue.mutex already locked
+static void save_download_queue(AppState *st) {
+    FILE *f = fopen(st->download_queue_file, "w");
+    if (!f) {
+        return;
+    }
+
+    fprintf(f, "{\n  \"tasks\": [\n");
+
+    bool first = true;
+    for (int i = 0; i < st->download_queue.count; i++) {
+        DownloadTask *task = &st->download_queue.tasks[i];
+
+        // Only save pending or failed tasks
+        if (task->status != DOWNLOAD_PENDING && task->status != DOWNLOAD_FAILED) {
+            continue;
+        }
+
+        char *escaped_title = json_escape_string(task->title);
+        char *escaped_filename = json_escape_string(task->sanitized_filename);
+        char *escaped_playlist = json_escape_string(task->playlist_name);
+
+        const char *status_str = task->status == DOWNLOAD_FAILED ? "failed" : "pending";
+
+        if (!first) fprintf(f, ",\n");
+        first = false;
+
+        fprintf(f, "    {\"video_id\": \"%s\", \"title\": \"%s\", \"filename\": \"%s\", \"playlist\": \"%s\", \"status\": \"%s\"}",
+                task->video_id,
+                escaped_title ? escaped_title : "",
+                escaped_filename ? escaped_filename : "",
+                escaped_playlist ? escaped_playlist : "",
+                status_str);
+
+        free(escaped_title);
+        free(escaped_filename);
+        free(escaped_playlist);
+    }
+
+    fprintf(f, "\n  ]\n}\n");
+    fclose(f);
+}
+
+static void load_download_queue(AppState *st) {
+    FILE *f = fopen(st->download_queue_file, "r");
+    if (!f) return;
+    
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    
+    if (fsize <= 0 || fsize > 1024 * 1024) {
+        fclose(f);
+        return;
+    }
+    
+    char *content = malloc(fsize + 1);
+    if (!content) {
+        fclose(f);
+        return;
+    }
+    
+    size_t read_size = fread(content, 1, fsize, f);
+    content[read_size] = '\0';
+    fclose(f);
+    
+    const char *p = strstr(content, "\"tasks\"");
+    if (!p) {
+        free(content);
+        return;
+    }
+    
+    p = strchr(p, '[');
+    if (!p) {
+        free(content);
+        return;
+    }
+    
+    pthread_mutex_lock(&st->download_queue.mutex);
+    
+    while (st->download_queue.count < MAX_DOWNLOAD_QUEUE) {
+        const char *obj_start = strchr(p, '{');
+        if (!obj_start) break;
+        
+        const char *obj_end = strchr(obj_start, '}');
+        if (!obj_end) break;
+        
+        size_t obj_len = obj_end - obj_start + 1;
+        char *obj = malloc(obj_len + 1);
+        if (!obj) break;
+        
+        memcpy(obj, obj_start, obj_len);
+        obj[obj_len] = '\0';
+        
+        char *video_id = json_get_string(obj, "video_id");
+        char *title = json_get_string(obj, "title");
+        char *filename = json_get_string(obj, "filename");
+        char *playlist = json_get_string(obj, "playlist");
+        char *status_str = json_get_string(obj, "status");
+        
+        if (video_id && video_id[0]) {
+            DownloadTask *task = &st->download_queue.tasks[st->download_queue.count];
+            
+            strncpy(task->video_id, video_id, sizeof(task->video_id) - 1);
+            strncpy(task->title, title ? title : "", sizeof(task->title) - 1);
+            strncpy(task->sanitized_filename, filename ? filename : "", sizeof(task->sanitized_filename) - 1);
+            strncpy(task->playlist_name, playlist ? playlist : "", sizeof(task->playlist_name) - 1);
+            
+            if (status_str && strcmp(status_str, "failed") == 0) {
+                task->status = DOWNLOAD_FAILED;
+                st->download_queue.failed++;
+            } else {
+                task->status = DOWNLOAD_PENDING;
+            }
+            
+            st->download_queue.count++;
+        }
+        
+        free(video_id);
+        free(title);
+        free(filename);
+        free(playlist);
+        free(status_str);
+        free(obj);
+        
+        p = obj_end + 1;
+    }
+    
+    pthread_mutex_unlock(&st->download_queue.mutex);
+    free(content);
+}
+
+// ============================================================================
+// NEW: Download Thread
+// ============================================================================
+
+static void *download_thread_func(void *arg) {
+    AppState *st = (AppState *)arg;
+    
+    while (!st->download_queue.should_stop) {
+        pthread_mutex_lock(&st->download_queue.mutex);
+        
+        // Find next pending task
+        int task_idx = -1;
+        for (int i = 0; i < st->download_queue.count; i++) {
+            if (st->download_queue.tasks[i].status == DOWNLOAD_PENDING) {
+                task_idx = i;
+                st->download_queue.tasks[i].status = DOWNLOAD_ACTIVE;
+                st->download_queue.current_idx = i;
+                st->download_queue.active = true;
+                break;
+            }
+        }
+        
+        if (task_idx < 0) {
+            // No pending tasks
+            st->download_queue.active = false;
+            st->download_queue.current_idx = -1;
+            pthread_mutex_unlock(&st->download_queue.mutex);
+            usleep(500 * 1000);  // Sleep 500ms
+            continue;
+        }
+        
+        // Copy task data while holding lock
+        DownloadTask task;
+        memcpy(&task, &st->download_queue.tasks[task_idx], sizeof(DownloadTask));
+        
+        pthread_mutex_unlock(&st->download_queue.mutex);
+        
+        // Build destination path
+        char dest_dir[1024];
+        char dest_path[1280];
+        
+        if (task.playlist_name[0]) {
+            snprintf(dest_dir, sizeof(dest_dir), "%s/%s", 
+                     st->config.download_path, task.playlist_name);
+        } else {
+            snprintf(dest_dir, sizeof(dest_dir), "%s", st->config.download_path);
+        }
+        
+        // Create directory if needed
+        mkdir_p(dest_dir);
+        
+        snprintf(dest_path, sizeof(dest_path), "%s/%s", dest_dir, task.sanitized_filename);
+        
+        // Check if file already exists (double-check)
+        if (file_exists(dest_path)) {
+            pthread_mutex_lock(&st->download_queue.mutex);
+            st->download_queue.tasks[task_idx].status = DOWNLOAD_COMPLETED;
+            st->download_queue.completed++;
+            save_download_queue(st);
+            pthread_mutex_unlock(&st->download_queue.mutex);
+            continue;
+        }
+        
+        // Build yt-dlp command
+        char cmd[4096];
+        snprintf(cmd, sizeof(cmd),
+                 "yt-dlp -x --audio-format mp3 --no-playlist --quiet --no-warnings "
+                 "-o '%s' 'https://www.youtube.com/watch?v=%s' >/dev/null 2>&1",
+                 dest_path, task.video_id);
+        
+        // Execute download
+        int result = system(cmd);
+        
+        pthread_mutex_lock(&st->download_queue.mutex);
+        
+        if (result == 0 && file_exists(dest_path)) {
+            st->download_queue.tasks[task_idx].status = DOWNLOAD_COMPLETED;
+            st->download_queue.completed++;
+        } else {
+            st->download_queue.tasks[task_idx].status = DOWNLOAD_FAILED;
+            st->download_queue.failed++;
+        }
+        
+        save_download_queue(st);
+        pthread_mutex_unlock(&st->download_queue.mutex);
+    }
+    
+    return NULL;
+}
+
+static void start_download_thread(AppState *st) {
+    if (st->download_queue.thread_running) return;
+    
+    st->download_queue.should_stop = false;
+    
+    if (pthread_create(&st->download_queue.thread, NULL, download_thread_func, st) == 0) {
+        st->download_queue.thread_running = true;
+    }
+}
+
+static void stop_download_thread(AppState *st) {
+    if (!st->download_queue.thread_running) return;
+    
+    st->download_queue.should_stop = true;
+    pthread_join(st->download_queue.thread, NULL);
+    st->download_queue.thread_running = false;
+}
+
+// ============================================================================
+// NEW: Download Queue Management
+// ============================================================================
+
+static int add_to_download_queue(AppState *st, const char *video_id, const char *title, 
+                                  const char *playlist_name) {
+    if (!video_id || !video_id[0]) return -1;
+    
+    // Build destination directory
+    char dest_dir[1024];
+    if (playlist_name && playlist_name[0]) {
+        snprintf(dest_dir, sizeof(dest_dir), "%s/%s", 
+                 st->config.download_path, playlist_name);
+    } else {
+        snprintf(dest_dir, sizeof(dest_dir), "%s", st->config.download_path);
+    }
+    
+    // Check if already downloaded
+    if (file_exists_for_video(dest_dir, video_id)) {
+        return 0;  // Already exists
+    }
+    
+    pthread_mutex_lock(&st->download_queue.mutex);
+    
+    // Check if already in queue
+    for (int i = 0; i < st->download_queue.count; i++) {
+        if (strcmp(st->download_queue.tasks[i].video_id, video_id) == 0 &&
+            st->download_queue.tasks[i].status == DOWNLOAD_PENDING) {
+            pthread_mutex_unlock(&st->download_queue.mutex);
+            return 0;  // Already queued
+        }
+    }
+    
+    // Check queue capacity
+    if (st->download_queue.count >= MAX_DOWNLOAD_QUEUE) {
+        pthread_mutex_unlock(&st->download_queue.mutex);
+        return -1;
+    }
+    
+    // Add new task
+    DownloadTask *task = &st->download_queue.tasks[st->download_queue.count];
+    
+    strncpy(task->video_id, video_id, sizeof(task->video_id) - 1);
+    task->video_id[sizeof(task->video_id) - 1] = '\0';
+    
+    strncpy(task->title, title ? title : "Unknown", sizeof(task->title) - 1);
+    task->title[sizeof(task->title) - 1] = '\0';
+    
+    sanitize_title_for_filename(title, video_id, task->sanitized_filename, 
+                                 sizeof(task->sanitized_filename));
+    
+    if (playlist_name) {
+        strncpy(task->playlist_name, playlist_name, sizeof(task->playlist_name) - 1);
+        task->playlist_name[sizeof(task->playlist_name) - 1] = '\0';
+    } else {
+        task->playlist_name[0] = '\0';
+    }
+    
+    task->status = DOWNLOAD_PENDING;
+    st->download_queue.count++;
+    
+    save_download_queue(st);
+    
+    pthread_mutex_unlock(&st->download_queue.mutex);
+    
+    // Start download thread if not running
+    start_download_thread(st);
+    
+    return 1;  // Added to queue
+}
+
+static int get_pending_download_count(AppState *st) {
+    pthread_mutex_lock(&st->download_queue.mutex);
+    int count = 0;
+    for (int i = 0; i < st->download_queue.count; i++) {
+        if (st->download_queue.tasks[i].status == DOWNLOAD_PENDING ||
+            st->download_queue.tasks[i].status == DOWNLOAD_ACTIVE) {
+            count++;
+        }
+    }
+    pthread_mutex_unlock(&st->download_queue.mutex);
+    return count;
 }
 
 // ============================================================================
@@ -557,24 +1204,36 @@ static int create_playlist(AppState *st, const char *name) {
 
 static bool delete_playlist(AppState *st, int idx) {
     if (idx < 0 || idx >= st->playlist_count) return false;
-    
-    // Delete the file
+
+    // Save playlist name before freeing (needed for directory deletion)
+    char playlist_name[256];
+    strncpy(playlist_name, st->playlists[idx].name, sizeof(playlist_name) - 1);
+    playlist_name[sizeof(playlist_name) - 1] = '\0';
+
+    // Delete the playlist JSON file
     char path[1024];
     snprintf(path, sizeof(path), "%s/%s", st->playlists_dir, st->playlists[idx].filename);
     unlink(path);
-    
+
+    // Delete the download directory and all downloaded songs
+    char download_dir[1024];
+    snprintf(download_dir, sizeof(download_dir), "%s/%s", st->config.download_path, playlist_name);
+    if (dir_exists(download_dir)) {
+        delete_directory_recursive(download_dir);
+    }
+
     // Free memory
     free_playlist(&st->playlists[idx]);
-    
+
     // Shift remaining playlists
     for (int i = idx; i < st->playlist_count - 1; i++) {
         st->playlists[i] = st->playlists[i + 1];
     }
     st->playlist_count--;
-    
+
     // Clear the last slot
     memset(&st->playlists[st->playlist_count], 0, sizeof(Playlist));
-    
+
     save_playlists_index(st);
     return true;
 }
@@ -602,15 +1261,19 @@ static bool add_song_to_playlist(AppState *st, int playlist_idx, Song *song) {
     int idx = pl->count;
     pl->items[idx].title = song->title ? strdup(song->title) : strdup("Unknown");
     pl->items[idx].video_id = strdup(song->video_id);
-    
+
     char url[256];
     snprintf(url, sizeof(url), "https://www.youtube.com/watch?v=%s", song->video_id);
     pl->items[idx].url = strdup(url);
     pl->items[idx].duration = song->duration;
-    
+
     pl->count++;
-    
+
     save_playlist(st, playlist_idx);
+
+    // Automatically queue song for download
+    add_to_download_queue(st, song->video_id, song->title, pl->name);
+
     return true;
 }
 
@@ -855,7 +1518,7 @@ static int run_search(AppState *st, const char *raw_query) {
     
     char cmd[2048];
     snprintf(cmd, sizeof(cmd),
-             "yt-dlp --flat-playlist "
+             "yt-dlp --flat-playlist --quiet --no-warnings "
              "--print '%%(title)s|||%%(id)s' "
              "\"ytsearch%d:%s\" 2>/dev/null",
              MAX_RESULTS, escaped_query);
@@ -940,14 +1603,24 @@ static void play_search_result(AppState *st, int idx) {
 
 static void play_playlist_song(AppState *st, int playlist_idx, int song_idx) {
     if (playlist_idx < 0 || playlist_idx >= st->playlist_count) return;
-    
+
     Playlist *pl = &st->playlists[playlist_idx];
     if (song_idx < 0 || song_idx >= pl->count) return;
     if (!pl->items[song_idx].url) return;
-    
+
     mpv_start_if_needed();
-    mpv_load_url(pl->items[song_idx].url);
-    
+
+    // Check if local file exists for this song
+    char local_path[2048];
+    if (get_local_file_path_for_song(st, pl->name, pl->items[song_idx].video_id,
+                                      local_path, sizeof(local_path))) {
+        // Play from local file
+        mpv_load_url(local_path);
+    } else {
+        // Stream from YouTube
+        mpv_load_url(pl->items[song_idx].url);
+    }
+
     st->playing_index = song_idx;
     st->playing_from_playlist = true;
     st->playing_playlist_idx = playlist_idx;
@@ -1007,27 +1680,85 @@ static void format_duration(int sec, char out[16]) {
     }
 }
 
+// NEW: Updated draw_header to include VIEW_SETTINGS
 static void draw_header(int cols, ViewMode view) {
+    // Line 1: Title
     attron(A_BOLD);
-    mvprintw(0, 0, " ShellBeats v0.2 ");
+    mvprintw(0, 0, " ShellBeats v0.3 ");
     attroff(A_BOLD);
-    
+
+    // Line 2-3: Shortcuts (two lines)
     switch (view) {
         case VIEW_SEARCH:
-            printw("| /: search | Enter: play | Space: pause | n/p: next/prev | f: playlists | a: add | q: quit");
+            mvprintw(1, 0, "  /,s: search | Enter: play | Space: pause | n: next | p: prev | x: stop");
+            mvprintw(2, 0, "  a: add to playlist | d: download | c: create playlist | f: playlists | S: settings | i: about | q: quit");
             break;
         case VIEW_PLAYLISTS:
-            printw("| Enter: open | c: create | x: delete | Esc: back | q: quit");
+            mvprintw(1, 0, "  Enter: open | d: download all | c: create | x: delete");
+            mvprintw(2, 0, "  Esc: back | i: about | q: quit");
             break;
         case VIEW_PLAYLIST_SONGS:
-            printw("| Enter: play | d: remove song | Esc: back | q: quit");
+            mvprintw(1, 0, "  Enter: play | Space: pause | n: next | p: prev | x: stop");
+            mvprintw(2, 0, "  a: add song | d: download | r: remove | Esc: back | i: about | q: quit");
             break;
         case VIEW_ADD_TO_PLAYLIST:
-            printw("| Enter: add to playlist | c: create new | Esc: cancel");
+            mvprintw(1, 0, "  Enter: add to playlist | c: create new playlist");
+            mvprintw(2, 0, "  Esc: cancel");
+            break;
+        case VIEW_SETTINGS:
+            mvprintw(1, 0, "  Enter: edit download path");
+            mvprintw(2, 0, "  Esc: back | i: about | q: quit");
+            break;
+        case VIEW_ABOUT:
+            mvprintw(1, 0, "  Press any key to close");
+            mvprintw(2, 0, "");
             break;
     }
+
+    mvhline(3, 0, ACS_HLINE, cols);
+}
+
+// NEW: Get spinner character for download animation
+static char get_spinner_char(int frame) {
+    const char spinner[] = {'|', '/', '-', '\\'};
+    return spinner[frame % 4];
+}
+
+// NEW: Draw download status in status bar area
+static void draw_download_status(AppState *st, int rows, int cols) {
+    pthread_mutex_lock(&st->download_queue.mutex);
     
-    mvhline(1, 0, ACS_HLINE, cols);
+    int pending_count = 0;
+    int completed = st->download_queue.completed;
+    int failed = st->download_queue.failed;
+    
+    for (int i = 0; i < st->download_queue.count; i++) {
+        if (st->download_queue.tasks[i].status == DOWNLOAD_PENDING ||
+            st->download_queue.tasks[i].status == DOWNLOAD_ACTIVE) {
+            pending_count++;
+        }
+    }
+    
+    pthread_mutex_unlock(&st->download_queue.mutex);
+    
+    if (pending_count == 0) return;
+    
+    // Draw at the right side of the now playing bar
+    char dl_status[64];
+    char spinner = get_spinner_char(st->spinner_frame);
+    
+    if (failed > 0) {
+        snprintf(dl_status, sizeof(dl_status), "[%c %d/%d %d!]", 
+                 spinner, completed, completed + pending_count, failed);
+    } else {
+        snprintf(dl_status, sizeof(dl_status), "[%c %d/%d]", 
+                 spinner, completed, completed + pending_count);
+    }
+    
+    int x = cols - strlen(dl_status) - 1;
+    if (x > 0) {
+        mvprintw(rows - 1, x, "%s", dl_status);
+    }
 }
 
 static void draw_now_playing(AppState *st, int rows, int cols) {
@@ -1049,7 +1780,7 @@ static void draw_now_playing(AppState *st, int rows, int cols) {
         mvprintw(rows - 1, 0, " Now playing: ");
         attron(A_BOLD);
         
-        int max_np = cols - 20;
+        int max_np = cols - 35;  // Leave room for download status
         char npbuf[512];
         strncpy(npbuf, title, sizeof(npbuf) - 1);
         npbuf[sizeof(npbuf) - 1] = '\0';
@@ -1066,42 +1797,45 @@ static void draw_now_playing(AppState *st, int rows, int cols) {
             printw(" [PAUSED]");
         }
     }
+    
+    // NEW: Draw download status
+    draw_download_status(st, rows, cols);
 }
 
 static void draw_search_view(AppState *st, const char *status, int rows, int cols) {
-    mvprintw(2, 0, "Query: ");
+    mvprintw(4, 0, "Query: ");
     attron(A_BOLD);
     printw("%s", st->query[0] ? st->query : "(none)");
     attroff(A_BOLD);
-    
-    mvprintw(2, cols - 20, "Results: %d", st->search_count);
-    
+
+    mvprintw(4, cols - 20, "Results: %d", st->search_count);
+
     if (status && status[0]) {
-        mvprintw(3, 0, ">>> %s", status);
+        mvprintw(5, 0, ">>> %s", status);
     }
-    
-    mvhline(4, 0, ACS_HLINE, cols);
-    
-    int list_top = 5;
+
+    mvhline(6, 0, ACS_HLINE, cols);
+
+    int list_top = 7;
     int list_height = rows - list_top - 2;
     if (list_height < 1) list_height = 1;
-    
+
     // Adjust scroll
     if (st->search_selected < st->search_scroll) {
         st->search_scroll = st->search_selected;
     } else if (st->search_selected >= st->search_scroll + list_height) {
         st->search_scroll = st->search_selected - list_height + 1;
     }
-    
+
     for (int i = 0; i < list_height && (st->search_scroll + i) < st->search_count; i++) {
         int idx = st->search_scroll + i;
         bool is_selected = (idx == st->search_selected);
         bool is_playing = (!st->playing_from_playlist && idx == st->playing_index);
-        
+
         int y = list_top + i;
         move(y, 0);
         clrtoeol();
-        
+
         char mark = ' ';
         if (is_playing) {
             mark = st->paused ? '|' : '>';
@@ -1110,26 +1844,33 @@ static void draw_search_view(AppState *st, const char *status, int rows, int col
         if (is_selected) {
             attron(A_REVERSE);
         }
-        
+
         char dur[16];
         format_duration(st->search_results[idx].duration, dur);
-        
-        int max_title = cols - 14;
+
+        // Check if song is downloaded
+        char local_path[2048];
+        bool is_downloaded = get_local_file_path_for_song(st, NULL,
+                                                           st->search_results[idx].video_id,
+                                                           local_path, sizeof(local_path));
+        const char *dl_mark = is_downloaded ? "[D]" : "   ";
+
+        int max_title = cols - 20;
         if (max_title < 20) max_title = 20;
-        
+
         char titlebuf[1024];
         const char *title = st->search_results[idx].title ? st->search_results[idx].title : "(no title)";
         strncpy(titlebuf, title, sizeof(titlebuf) - 1);
         titlebuf[sizeof(titlebuf) - 1] = '\0';
-        
+
         if ((int)strlen(titlebuf) > max_title && max_title > 3) {
             titlebuf[max_title - 3] = '.';
             titlebuf[max_title - 2] = '.';
             titlebuf[max_title - 1] = '.';
             titlebuf[max_title] = '\0';
         }
-        
-        mvprintw(y, 0, " %c %3d. [%s] %s", mark, idx + 1, dur, titlebuf);
+
+        mvprintw(y, 0, " %c %3d. %s [%s] %s", mark, idx + 1, dl_mark, dur, titlebuf);
         
         if (is_selected) {
             attroff(A_REVERSE);
@@ -1141,16 +1882,16 @@ static void draw_search_view(AppState *st, const char *status, int rows, int col
 }
 
 static void draw_playlists_view(AppState *st, const char *status, int rows, int cols) {
-    mvprintw(2, 0, "Playlists");
-    mvprintw(2, cols - 20, "Total: %d", st->playlist_count);
-    
+    mvprintw(4, 0, "Playlists");
+    mvprintw(4, cols - 20, "Total: %d", st->playlist_count);
+
     if (status && status[0]) {
-        mvprintw(3, 0, ">>> %s", status);
+        mvprintw(5, 0, ">>> %s", status);
     }
-    
-    mvhline(4, 0, ACS_HLINE, cols);
-    
-    int list_top = 5;
+
+    mvhline(6, 0, ACS_HLINE, cols);
+
+    int list_top = 7;
     int list_height = rows - list_top - 2;
     if (list_height < 1) list_height = 1;
     
@@ -1198,21 +1939,21 @@ static void draw_playlist_songs_view(AppState *st, const char *status, int rows,
     }
     
     Playlist *pl = &st->playlists[st->current_playlist_idx];
-    
-    mvprintw(2, 0, "Playlist: ");
+
+    mvprintw(4, 0, "Playlist: ");
     attron(A_BOLD);
     printw("%s", pl->name);
     attroff(A_BOLD);
-    
-    mvprintw(2, cols - 20, "Songs: %d", pl->count);
-    
+
+    mvprintw(4, cols - 20, "Songs: %d", pl->count);
+
     if (status && status[0]) {
-        mvprintw(3, 0, ">>> %s", status);
+        mvprintw(5, 0, ">>> %s", status);
     }
-    
-    mvhline(4, 0, ACS_HLINE, cols);
-    
-    int list_top = 5;
+
+    mvhline(6, 0, ACS_HLINE, cols);
+
+    int list_top = 7;
     int list_height = rows - list_top - 2;
     if (list_height < 1) list_height = 1;
     
@@ -1250,23 +1991,30 @@ static void draw_playlist_songs_view(AppState *st, const char *status, int rows,
         
         char dur[16];
         format_duration(pl->items[idx].duration, dur);
-        
-        int max_title = cols - 14;
+
+        // Check if song is downloaded
+        char local_path[2048];
+        bool is_downloaded = get_local_file_path_for_song(st, pl->name,
+                                                           pl->items[idx].video_id,
+                                                           local_path, sizeof(local_path));
+        const char *dl_mark = is_downloaded ? "[D]" : "   ";
+
+        int max_title = cols - 20;
         if (max_title < 20) max_title = 20;
-        
+
         char titlebuf[1024];
         const char *title = pl->items[idx].title ? pl->items[idx].title : "(no title)";
         strncpy(titlebuf, title, sizeof(titlebuf) - 1);
         titlebuf[sizeof(titlebuf) - 1] = '\0';
-        
+
         if ((int)strlen(titlebuf) > max_title && max_title > 3) {
             titlebuf[max_title - 3] = '.';
             titlebuf[max_title - 2] = '.';
             titlebuf[max_title - 1] = '.';
             titlebuf[max_title] = '\0';
         }
-        
-        mvprintw(y, 0, " %c %3d. [%s] %s", mark, idx + 1, dur, titlebuf);
+
+        mvprintw(y, 0, " %c %3d. %s [%s] %s", mark, idx + 1, dl_mark, dur, titlebuf);
         
         if (is_selected) {
             attroff(A_REVERSE);
@@ -1296,15 +2044,15 @@ static void draw_add_to_playlist_view(AppState *st, const char *status, int rows
     }
     
     if (status && status[0]) {
-        mvprintw(3, 0, ">>> %s", status);
+        mvprintw(5, 0, ">>> %s", status);
     }
-    
-    mvhline(4, 0, ACS_HLINE, cols);
-    
-    int list_top = 5;
+
+    mvhline(6, 0, ACS_HLINE, cols);
+
+    int list_top = 7;
     int list_height = rows - list_top - 2;
     if (list_height < 1) list_height = 1;
-    
+
     if (st->playlist_count == 0) {
         mvprintw(list_top + 1, 2, "No playlists yet. Press 'c' to create one.");
         return;
@@ -1338,6 +2086,156 @@ static void draw_add_to_playlist_view(AppState *st, const char *status, int rows
     }
 }
 
+// NEW: Draw settings view
+static void draw_settings_view(AppState *st, const char *status, int rows, int cols) {
+    mvprintw(4, 0, "Settings");
+
+    if (status && status[0]) {
+        mvprintw(5, 0, ">>> %s", status);
+    }
+
+    mvhline(6, 0, ACS_HLINE, cols);
+
+    int y = 8;
+    
+    // Download Path setting
+    bool is_selected = (st->settings_selected == 0);
+    
+    mvprintw(y, 2, "Download Path:");
+    y++;
+    
+    if (is_selected) {
+        attron(A_REVERSE);
+    }
+    
+    if (st->settings_editing && is_selected) {
+        // Show edit buffer with cursor
+        mvprintw(y, 4, "%-*s", cols - 8, st->settings_edit_buffer);
+        
+        // Position cursor
+        move(y, 4 + st->settings_edit_pos);
+        curs_set(1);
+    } else {
+        // Show current value
+        int max_path = cols - 8;
+        char pathbuf[1024];
+        strncpy(pathbuf, st->config.download_path, sizeof(pathbuf) - 1);
+        pathbuf[sizeof(pathbuf) - 1] = '\0';
+        
+        if ((int)strlen(pathbuf) > max_path && max_path > 3) {
+            // Truncate from the beginning to show the end of the path
+            int offset = strlen(pathbuf) - max_path + 3;
+            memmove(pathbuf + 3, pathbuf + offset, strlen(pathbuf) - offset + 1);
+            pathbuf[0] = '.';
+            pathbuf[1] = '.';
+            pathbuf[2] = '.';
+        }
+        
+        mvprintw(y, 4, "%s", pathbuf);
+        curs_set(0);
+    }
+    
+    if (is_selected) {
+        attroff(A_REVERSE);
+    }
+    
+    y += 2;
+    
+    // Help text
+    mvprintw(y, 2, "Press Enter to edit, Esc to go back");
+    y++;
+    
+    if (st->settings_editing) {
+        mvprintw(y, 2, "Editing: Enter to save, Esc to cancel");
+    }
+}
+
+// NEW: Draw exit confirmation dialog when downloads are pending
+static void draw_exit_dialog(AppState *st, int pending_count) {
+    int rows, cols;
+    getmaxyx(stdscr, rows, cols);
+    
+    int dialog_w = 50;
+    int dialog_h = 8;
+    int start_x = (cols - dialog_w) / 2;
+    int start_y = (rows - dialog_h) / 2;
+    
+    // Draw box background
+    for (int y = start_y; y < start_y + dialog_h; y++) {
+        mvhline(y, start_x, ' ', dialog_w);
+    }
+    
+    // Draw title bar
+    attron(A_REVERSE);
+    mvprintw(start_y, start_x, "%-*s", dialog_w, "");
+    mvprintw(start_y, start_x + (dialog_w - 16) / 2, " Download Queue ");
+    attroff(A_REVERSE);
+    
+    // Draw content
+    mvprintw(start_y + 2, start_x + 2, "Downloads in progress: %d remaining", pending_count);
+    mvprintw(start_y + 4, start_x + 2, "Downloads will resume on next startup.");
+    
+    // Draw options
+    attron(A_BOLD);
+    mvprintw(start_y + 6, start_x + 2, "[q] Quit anyway    [Esc] Cancel");
+    attroff(A_BOLD);
+    
+    refresh();
+}
+
+// NEW: Draw About overlay
+static void draw_about_view(AppState *st, const char *status, int rows, int cols) {
+    (void)st; // Unused
+    (void)status; // Unused
+
+    int dialog_w = 60;
+    int dialog_h = 16;
+    int start_x = (cols - dialog_w) / 2;
+    int start_y = (rows - dialog_h) / 2;
+
+    // Draw box background
+    attron(A_BOLD);
+    for (int y = start_y; y < start_y + dialog_h; y++) {
+        mvhline(y, start_x, ' ', dialog_w);
+    }
+    attroff(A_BOLD);
+
+    // Draw border
+    attron(A_BOLD);
+    mvaddch(start_y, start_x, ACS_ULCORNER);
+    mvaddch(start_y, start_x + dialog_w - 1, ACS_URCORNER);
+    mvaddch(start_y + dialog_h - 1, start_x, ACS_LLCORNER);
+    mvaddch(start_y + dialog_h - 1, start_x + dialog_w - 1, ACS_LRCORNER);
+    mvhline(start_y, start_x + 1, ACS_HLINE, dialog_w - 2);
+    mvhline(start_y + dialog_h - 1, start_x + 1, ACS_HLINE, dialog_w - 2);
+    mvvline(start_y + 1, start_x, ACS_VLINE, dialog_h - 2);
+    mvvline(start_y + 1, start_x + dialog_w - 1, ACS_VLINE, dialog_h - 2);
+    attroff(A_BOLD);
+
+    // Title
+    attron(A_BOLD | A_REVERSE);
+    mvprintw(start_y + 2, start_x + (dialog_w - 15) / 2, " ShellBeats v0.3");
+    attroff(A_BOLD | A_REVERSE);
+
+    // Version and description
+    mvprintw(start_y + 4, start_x + (dialog_w - 28) / 2, "made by Lalo for Nami & Elia");
+    mvprintw(start_y + 6, start_x + (dialog_w - 44) / 2, "A terminal-based music player for YouTube");
+
+    // Features
+    mvprintw(start_y + 8, start_x + 4, "Features:");
+    mvprintw(start_y + 9, start_x + 6, "* Search and stream music from YouTube");
+    mvprintw(start_y + 10, start_x + 6, "* Download songs as MP3");
+    mvprintw(start_y + 11, start_x + 6, "* Create and manage playlists");
+    mvprintw(start_y + 12, start_x + 6, "* Offline playback from local files");
+
+    // Footer
+    attron(A_DIM);
+    mvprintw(start_y + 14, start_x + (dialog_w - 40) / 2, "Built with mpv, yt-dlp, and ncurses");
+    attroff(A_DIM);
+
+    refresh();
+}
+
 static void draw_ui(AppState *st, const char *status) {
     erase();
     
@@ -1358,6 +2256,12 @@ static void draw_ui(AppState *st, const char *status) {
             break;
         case VIEW_ADD_TO_PLAYLIST:
             draw_add_to_playlist_view(st, status, rows, cols);
+            break;
+        case VIEW_SETTINGS:
+            draw_settings_view(st, status, rows, cols);
+            break;
+        case VIEW_ABOUT:
+            draw_about_view(st, status, rows, cols);
             break;
     }
     
@@ -1419,7 +2323,7 @@ static void show_help(void) {
     
     int y = 2;
     attron(A_BOLD);
-    mvprintw(y++, 2, "ShellBeats v0.2 | Help");
+    mvprintw(y++, 2, "ShellBeats v0.3 | Help");
     attroff(A_BOLD);
     y++;
     
@@ -1433,6 +2337,7 @@ static void show_help(void) {
     mvprintw(y++, 6, "Up/Down/j/k Navigate list");
     mvprintw(y++, 6, "PgUp/PgDn   Page up/down");
     mvprintw(y++, 6, "g/G         Go to start/end");
+    mvprintw(y++, 6, "S           Settings");  // NEW
     mvprintw(y++, 6, "h or ?      Show this help");
     mvprintw(y++, 6, "q           Quit");
     y++;
@@ -1453,7 +2358,9 @@ static void show_help(void) {
     attroff(A_REVERSE);
     
     refresh();
+    timeout(-1);
     getch();
+    timeout(100);
 }
 
 static bool check_dependencies(char *errmsg, size_t errsz) {
@@ -1495,14 +2402,30 @@ int main(void) {
     st.current_playlist_idx = -1;
     st.view = VIEW_SEARCH;
     
+    // NEW: Initialize download queue mutex
+    pthread_mutex_init(&st.download_queue.mutex, NULL);
+    st.download_queue.current_idx = -1;
+    g_app_state = &st;
+    
     // Initialize config directories
     if (!init_config_dirs(&st)) {
         fprintf(stderr, "Failed to initialize config directory\n");
         return 1;
     }
     
+    // NEW: Load configuration
+    load_config(&st);
+    
     // Load playlists
     load_playlists(&st);
+    
+    // NEW: Load pending downloads from previous session
+    load_download_queue(&st);
+    
+    // NEW: Start download thread if there are pending downloads
+    if (get_pending_download_count(&st) > 0) {
+        start_download_thread(&st);
+    }
     
     initscr();
     cbreak();
@@ -1524,16 +2447,22 @@ int main(void) {
         return 1;
     }
     
-    snprintf(status, sizeof(status), "Press / to search, f for playlists, h for help.");
+    snprintf(status, sizeof(status), "Press / to search, d to download, f for playlists, h for help.");
     draw_ui(&st, status);
     
     bool running = true;
     
     while (running) {
+        // NEW: Update spinner for download animation
+        time_t now = time(NULL);
+        if (now != st.last_spinner_update) {
+            st.spinner_frame++;
+            st.last_spinner_update = now;
+        }
+        
         // Check for track end via mpv IPC
-        // Only check if we've been playing for at least 3 seconds (grace period for loading)
+        // Only check if we've been playing for at least 3 seconds
         if (st.playing_index >= 0 && mpv_ipc_fd >= 0) {
-            time_t now = time(NULL);
             if (now - st.playback_started >= 3) {
                 if (mpv_check_track_end()) {
                     // Auto-play next track
@@ -1557,7 +2486,7 @@ int main(void) {
                     draw_ui(&st, status);
                 }
             } else {
-                // During grace period, still drain the socket buffer to avoid stale data
+                // During grace period, still drain the socket buffer
                 char drain_buf[4096];
                 while (read(mpv_ipc_fd, drain_buf, sizeof(drain_buf)) > 0) {
                     // Discard data during grace period
@@ -1566,9 +2495,10 @@ int main(void) {
         }
         
         int ch = getch();
-        
+
         if (ch == ERR) {
-            // Timeout - just redraw and continue
+            // Timeout - redraw UI to update spinner and download status
+            draw_ui(&st, status);
             continue;
         }
         
@@ -1578,11 +2508,99 @@ int main(void) {
         int list_height = rows - 7;
         if (list_height < 1) list_height = 1;
         
+        // NEW: Handle settings editing mode separately
+        if (st.view == VIEW_SETTINGS && st.settings_editing) {
+            switch (ch) {
+                case 27: // Escape - cancel editing
+                    st.settings_editing = false;
+                    curs_set(0);
+                    snprintf(status, sizeof(status), "Edit cancelled");
+                    break;
+                
+                case '\n':
+                case KEY_ENTER: // Save
+                    strncpy(st.config.download_path, st.settings_edit_buffer, 
+                            sizeof(st.config.download_path) - 1);
+                    st.config.download_path[sizeof(st.config.download_path) - 1] = '\0';
+                    save_config(&st);
+                    st.settings_editing = false;
+                    curs_set(0);
+                    snprintf(status, sizeof(status), "Download path saved");
+                    break;
+                
+                case KEY_BACKSPACE:
+                case 127:
+                case 8: // Backspace
+                    if (st.settings_edit_pos > 0) {
+                        memmove(&st.settings_edit_buffer[st.settings_edit_pos - 1],
+                                &st.settings_edit_buffer[st.settings_edit_pos],
+                                strlen(&st.settings_edit_buffer[st.settings_edit_pos]) + 1);
+                        st.settings_edit_pos--;
+                    }
+                    break;
+                
+                case KEY_DC: // Delete
+                    if (st.settings_edit_pos < (int)strlen(st.settings_edit_buffer)) {
+                        memmove(&st.settings_edit_buffer[st.settings_edit_pos],
+                                &st.settings_edit_buffer[st.settings_edit_pos + 1],
+                                strlen(&st.settings_edit_buffer[st.settings_edit_pos + 1]) + 1);
+                    }
+                    break;
+                
+                case KEY_LEFT:
+                    if (st.settings_edit_pos > 0) st.settings_edit_pos--;
+                    break;
+                
+                case KEY_RIGHT:
+                    if (st.settings_edit_pos < (int)strlen(st.settings_edit_buffer))
+                        st.settings_edit_pos++;
+                    break;
+                
+                case KEY_HOME:
+                    st.settings_edit_pos = 0;
+                    break;
+                
+                case KEY_END:
+                    st.settings_edit_pos = strlen(st.settings_edit_buffer);
+                    break;
+                
+                default:
+                    // Insert printable character
+                    if (ch >= 32 && ch < 127) {
+                        int len = strlen(st.settings_edit_buffer);
+                        if (len < (int)sizeof(st.settings_edit_buffer) - 1) {
+                            memmove(&st.settings_edit_buffer[st.settings_edit_pos + 1],
+                                    &st.settings_edit_buffer[st.settings_edit_pos],
+                                    len - st.settings_edit_pos + 1);
+                            st.settings_edit_buffer[st.settings_edit_pos] = ch;
+                            st.settings_edit_pos++;
+                        }
+                    }
+                    break;
+            }
+            draw_ui(&st, status);
+            continue;
+        }
+        
         // Global keys
         switch (ch) {
-            case 'q':
-                running = false;
+            case 'q': {
+                // NEW: Check for pending downloads before exiting
+                int pending = get_pending_download_count(&st);
+                if (pending > 0) {
+                    draw_exit_dialog(&st, pending);
+                    timeout(-1);
+                    int confirm = getch();
+                    timeout(100);
+                    if (confirm == 'q') {
+                        running = false;
+                    }
+                    // Otherwise continue (user cancelled)
+                } else {
+                    running = false;
+                }
                 continue;
+            }
             
             case ' ':
                 if (st.playing_index >= 0 && file_exists(IPC_SOCKET)) {
@@ -1610,7 +2628,16 @@ int main(void) {
             case '?':
                 show_help();
                 break;
-            
+
+            case 'i': // About
+                st.view = VIEW_ABOUT;
+                draw_ui(&st, status);
+                timeout(-1);
+                getch(); // Wait for any key
+                timeout(100);
+                st.view = VIEW_SEARCH;
+                break;
+
             case 27: // Escape
                 if (st.view == VIEW_PLAYLISTS) {
                     st.view = VIEW_SEARCH;
@@ -1622,6 +2649,12 @@ int main(void) {
                     st.view = VIEW_SEARCH;
                     st.song_to_add = NULL;
                     snprintf(status, sizeof(status), "Cancelled");
+                } else if (st.view == VIEW_SETTINGS) {
+                    st.view = VIEW_SEARCH;
+                    status[0] = '\0';
+                } else if (st.view == VIEW_ABOUT) {
+                    st.view = VIEW_SEARCH;
+                    status[0] = '\0';
                 }
                 break;
             
@@ -1751,6 +2784,31 @@ int main(void) {
                         }
                         break;
                     }
+                    
+                    // NEW: Open settings with 'S'
+                    case 'S':
+                        st.view = VIEW_SETTINGS;
+                        st.settings_selected = 0;
+                        st.settings_editing = false;
+                        snprintf(status, sizeof(status), "Settings");
+                        break;
+                    
+                    // NEW: Download single song from search
+                    case 'd':
+                        if (st.search_count > 0) {
+                            Song *song = &st.search_results[st.search_selected];
+                            int result = add_to_download_queue(&st, song->video_id, song->title, NULL);
+                            if (result > 0) {
+                                snprintf(status, sizeof(status), "Queued: %s", song->title);
+                            } else if (result == 0) {
+                                snprintf(status, sizeof(status), "Already downloaded or queued");
+                            } else {
+                                snprintf(status, sizeof(status), "Failed to queue download");
+                            }
+                        } else {
+                            snprintf(status, sizeof(status), "No song selected");
+                        }
+                        break;
                 }
                 break;
             }
@@ -1812,7 +2870,6 @@ int main(void) {
                     }
                     
                     case 'x':
-                    case 'd':
                         if (st.playlist_count > 0) {
                             char confirm[8] = {0};
                             char prompt[256];
@@ -1830,6 +2887,43 @@ int main(void) {
                                 }
                             } else {
                                 snprintf(status, sizeof(status), "Cancelled");
+                            }
+                        }
+                        break;
+                    
+                    // NEW: Download entire playlist
+                    case 'd':
+                        if (st.playlist_count > 0) {
+                            Playlist *pl = &st.playlists[st.playlist_selected];
+                            
+                            // Make sure songs are loaded
+                            if (pl->count == 0) {
+                                load_playlist_songs(&st, st.playlist_selected);
+                            }
+                            
+                            int added = 0;
+                            int skipped = 0;
+                            
+                            for (int i = 0; i < pl->count; i++) {
+                                int result = add_to_download_queue(&st, 
+                                    pl->items[i].video_id,
+                                    pl->items[i].title,
+                                    pl->name);
+                                
+                                if (result > 0) {
+                                    added++;
+                                } else if (result == 0) {
+                                    skipped++;
+                                }
+                            }
+                            
+                            if (added > 0) {
+                                snprintf(status, sizeof(status), "Queued %d songs (%d already downloaded)", 
+                                         added, skipped);
+                            } else if (skipped > 0) {
+                                snprintf(status, sizeof(status), "All %d songs already downloaded", skipped);
+                            } else {
+                                snprintf(status, sizeof(status), "Playlist is empty");
                             }
                         }
                         break;
@@ -1879,7 +2973,25 @@ int main(void) {
                         }
                         break;
                     
+                    // NEW: Download single song from playlist (saves to playlist folder)
                     case 'd':
+                        if (pl && pl->count > 0) {
+                            Song *song = &pl->items[st.playlist_song_selected];
+                            int result = add_to_download_queue(&st, song->video_id, song->title, pl->name);
+                            if (result > 0) {
+                                snprintf(status, sizeof(status), "Queued: %s", song->title);
+                            } else if (result == 0) {
+                                snprintf(status, sizeof(status), "Already downloaded or queued");
+                            } else {
+                                snprintf(status, sizeof(status), "Failed to queue download");
+                            }
+                        } else {
+                            snprintf(status, sizeof(status), "No song selected");
+                        }
+                        break;
+                    
+                    // Remove song with 'r' (was 'd')
+                    case 'r':
                         if (pl && pl->count > 0) {
                             const char *title = pl->items[st.playlist_song_selected].title;
                             if (remove_song_from_playlist(&st, st.current_playlist_idx, 
@@ -1962,10 +3074,49 @@ int main(void) {
                 }
                 break;
             }
+            
+            // NEW: Settings view key handling
+            case VIEW_SETTINGS: {
+                switch (ch) {
+                    case KEY_UP:
+                    case 'k':
+                        // For now only one setting, but prepared for more
+                        if (st.settings_selected > 0) st.settings_selected--;
+                        break;
+                    
+                    case KEY_DOWN:
+                    case 'j':
+                        // For now only one setting
+                        break;
+                    
+                    case '\n':
+                    case KEY_ENTER:
+                        // Enter edit mode
+                        if (st.settings_selected == 0) {
+                            st.settings_editing = true;
+                            strncpy(st.settings_edit_buffer, st.config.download_path,
+                                    sizeof(st.settings_edit_buffer) - 1);
+                            st.settings_edit_buffer[sizeof(st.settings_edit_buffer) - 1] = '\0';
+                            st.settings_edit_pos = strlen(st.settings_edit_buffer);
+                            snprintf(status, sizeof(status), "Editing download path...");
+                        }
+                        break;
+                }
+                break;
+            }
+
+            case VIEW_ABOUT: {
+                // About view doesn't handle any keys (just closes on any key)
+                break;
+            }
         }
-        
+
         draw_ui(&st, status);
     }
+    
+    // NEW: Stop download thread
+    stop_download_thread(&st);
+    pthread_mutex_destroy(&st.download_queue.mutex);
     
     endwin();
     

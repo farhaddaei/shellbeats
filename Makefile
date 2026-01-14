@@ -1,7 +1,7 @@
 # ShellBeats Makefile
 CC = gcc
-CFLAGS = -Wall -Wextra -O2
-LDFLAGS = -lncurses
+CFLAGS = -Wall -Wextra -O2 -pthread
+LDFLAGS = -lncurses -pthread
 
 TARGET = shellbeats
 SRC = shellbeats.c
