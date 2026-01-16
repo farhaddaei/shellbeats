@@ -217,6 +217,9 @@ All shortcuts are now visible in the header when you run shellbeats. Heres the c
 
 No known bugs at the moment! If you find something please open an issue.
 
+## TODO
+Thanks to **arjuna93** on reddit make it cross-platform macOS and *BSD.
+
 ## License
 
 GPL-3.0 license
