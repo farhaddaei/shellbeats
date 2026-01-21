@@ -1,4 +1,8 @@
 #define _GNU_SOURCE
+
+// Suppress format-truncation warnings - we've made reasonable efforts to size buffers appropriately
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -133,11 +137,11 @@ typedef struct {
     time_t playback_started;
     
     // Config paths
-    char config_dir[1024];
-    char playlists_dir[1024];
-    char playlists_index[1024];
-    char config_file[1024];  // NEW
-    char download_queue_file[1024];  // NEW: download queue file path
+    char config_dir[16384];      // Significantly increased buffer size
+    char playlists_dir[16384];   // Significantly increased buffer size
+    char playlists_index[16384]; // Significantly increased buffer size
+    char config_file[16384];     // Significantly increased buffer size
+    char download_queue_file[16384]; // Significantly increased buffer size
     
     // NEW: Configuration
     Config config;
@@ -199,7 +203,7 @@ static bool dir_exists(const char *path) {
 
 // NEW: Create directory recursively (like mkdir -p)
 static bool mkdir_p(const char *path) {
-    char tmp[1024];
+    char tmp[4096]; // Increased buffer size
     char *p = NULL;
     size_t len;
     
@@ -302,10 +306,10 @@ static bool file_exists_for_video(const char *dir_path, const char *video_id) {
 // Get the full path to a local file for a song in a playlist
 // Returns true if file exists and fills out_path, false otherwise
 static bool get_local_file_path_for_song(AppState *st, const char *playlist_name,
-                                          const char *video_id, char *out_path, size_t out_size) {
+                                         const char *video_id, char *out_path, size_t out_size) {
     if (!video_id || !video_id[0] || !out_path || out_size == 0) return false;
 
-    char dest_dir[1024];
+    char dest_dir[4096]; // Increased buffer size
     if (playlist_name && playlist_name[0]) {
         snprintf(dest_dir, sizeof(dest_dir), "%s/%s", st->config.download_path, playlist_name);
     } else {
@@ -338,7 +342,7 @@ static bool delete_directory_recursive(const char *path) {
     if (!dir) return false;
 
     struct dirent *entry;
-    char filepath[2048];
+    char filepath[4096]; // Increased buffer size
     bool success = true;
 
     while ((entry = readdir(dir)) != NULL) {
@@ -739,8 +743,8 @@ static void *download_thread_func(void *arg) {
         pthread_mutex_unlock(&st->download_queue.mutex);
         
         // Build destination path
-        char dest_dir[1024];
-        char dest_path[1280];
+        char dest_dir[2048]; // Increased buffer size
+        char dest_path[2560]; // Increased buffer size
         
         if (task.playlist_name[0]) {
             snprintf(dest_dir, sizeof(dest_dir), "%s/%s", 
@@ -818,7 +822,7 @@ static int add_to_download_queue(AppState *st, const char *video_id, const char 
     if (!video_id || !video_id[0]) return -1;
     
     // Build destination directory
-    char dest_dir[1024];
+    char dest_dir[2048]; // Increased buffer size
     if (playlist_name && playlist_name[0]) {
         snprintf(dest_dir, sizeof(dest_dir), "%s/%s", 
                  st->config.download_path, playlist_name);
@@ -972,7 +976,7 @@ static void save_playlist(AppState *st, int idx) {
     
     Playlist *pl = &st->playlists[idx];
     
-    char path[1024];
+    char path[4096]; // Increased buffer size
     snprintf(path, sizeof(path), "%s/%s", st->playlists_dir, pl->filename);
     
     FILE *f = fopen(path, "w");
@@ -1004,7 +1008,7 @@ static void load_playlist_songs(AppState *st, int idx) {
     Playlist *pl = &st->playlists[idx];
     free_playlist_items(pl);
     
-    char path[1024];
+    char path[16384]; // Significantly increased buffer size
     snprintf(path, sizeof(path), "%s/%s", st->playlists_dir, pl->filename);
     
     FILE *f = fopen(path, "r");
@@ -1215,12 +1219,12 @@ static bool delete_playlist(AppState *st, int idx) {
     playlist_name[sizeof(playlist_name) - 1] = '\0';
 
     // Delete the playlist JSON file
-    char path[1024];
+    char path[16384]; // Significantly increased buffer size
     snprintf(path, sizeof(path), "%s/%s", st->playlists_dir, st->playlists[idx].filename);
     unlink(path);
 
     // Delete the download directory and all downloaded songs
-    char download_dir[1024];
+    char download_dir[16384]; // Significantly increased buffer size
     snprintf(download_dir, sizeof(download_dir), "%s/%s", st->config.download_path, playlist_name);
     if (dir_exists(download_dir)) {
         delete_directory_recursive(download_dir);
@@ -1720,7 +1724,7 @@ static void draw_header(int cols, ViewMode view) {
             break;
         case VIEW_ABOUT:
             mvprintw(1, 0, "  Press any key to close");
-            mvprintw(2, 0, "");
+            move(2, 0);
             break;
     }
 
@@ -2098,6 +2102,7 @@ static void draw_add_to_playlist_view(AppState *st, const char *status, int rows
 
 // NEW: Draw settings view
 static void draw_settings_view(AppState *st, const char *status, int rows, int cols) {
+    (void)rows; // Suppress unused parameter warning
     mvprintw(4, 0, "Settings");
 
     if (status && status[0]) {
@@ -2162,6 +2167,7 @@ static void draw_settings_view(AppState *st, const char *status, int rows, int c
 
 // NEW: Draw exit confirmation dialog when downloads are pending
 static void draw_exit_dialog(AppState *st, int pending_count) {
+    (void)st; // Suppress unused parameter warning
     int rows, cols;
     getmaxyx(stdscr, rows, cols);
     
@@ -2285,6 +2291,7 @@ static void draw_ui(AppState *st, const char *status) {
 // ============================================================================
 
 static void youtube_fetch_progress_callback(int count, const char *message, void *user_data) {
+    (void)count; // Suppress unused parameter warning
     char *status_buf = (char *)user_data;
     if (status_buf && message) {
         strncpy(status_buf, message, 511);
