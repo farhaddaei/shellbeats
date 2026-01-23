@@ -13,7 +13,7 @@ https://shellbeats.com
 
 ![Demo](shellbeats.gif)
 
-A terminal music player for Linux. Search YouTube, stream audio, and download your favorite tracks directly from your command line.
+A terminal music player for Linux & OSX. Search YouTube, stream audio, and download your favorite tracks directly from your command line.
 
 ![shellbeats](screenshot.png)
 
