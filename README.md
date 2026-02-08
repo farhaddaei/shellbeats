@@ -334,7 +334,9 @@ Small bug with PAUSE command tracking, sometimes the UI reverts the [PAUSE] mess
 ## TODO
 Find a way to use an "AI agent" to find the music on Youtube and turn it into a Shellbeats playlist.
 
-Add support for unicode characters (had some problems was in 0.6 wishlist sorry)
+Manage cookie from browser.
+
+Add support for unicode characters (had some problems was in 0.6 wishlist sorry).
 
 
 ## License
