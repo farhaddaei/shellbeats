@@ -2295,7 +2295,7 @@ static void draw_header(int cols, ViewMode view) {
             break;
         case VIEW_PLAYLIST_SONGS:
             mvprintw(1, 0, "  Enter: play | Space: pause | n/p: next/prev | R: shuffle | t: jump | Left/Right: seek");
-            mvprintw(2, 0, "  a: add | d: download | r: remove | D: download all | Esc: back | q: quit");
+            mvprintw(2, 0, "  a: add | d: download | r: remove | D: download all | u: sync YT | Esc: back | q: quit");
             break;
         case VIEW_ADD_TO_PLAYLIST:
             mvprintw(1, 0, "  Enter: add to playlist | c: create new playlist");
@@ -3013,6 +3013,7 @@ static void show_help(void) {
     mvprintw(y++, 6, "r           Remove song from playlist");
     mvprintw(y++, 6, "d/D         Download song / Download all");
     mvprintw(y++, 6, "p           Import YouTube playlist");
+    mvprintw(y++, 6, "u           Sync YouTube playlist");
     mvprintw(y++, 6, "x           Delete playlist");
     y++;
 
@@ -3955,7 +3956,7 @@ int main(int argc, char *argv[]) {
                         if (pl && pl->is_youtube_playlist && pl->count > 0) {
                             int added = 0;
                             for (int i = 0; i < pl->count; i++) {
-                                int result = add_to_download_queue(&st, pl->items[i].video_id, 
+                                int result = add_to_download_queue(&st, pl->items[i].video_id,
                                                                    pl->items[i].title, pl->name);
                                 if (result > 0) added++;
                             }
@@ -3966,7 +3967,82 @@ int main(int argc, char *argv[]) {
                             }
                         }
                         break;
-                    
+
+                    case 'u': // Sync YouTube playlist
+                        if (pl && pl->is_youtube_playlist) {
+                            snprintf(status, sizeof(status), "Syncing playlist...");
+                            draw_ui(&st, status);
+
+                            char fetch_url[512] = {0};
+                            // For now, ask user to paste URL again
+                            int len = get_string_input(fetch_url, sizeof(fetch_url),
+                                "YouTube playlist URL to sync: ");
+
+                            if (len > 0 && validate_youtube_playlist_url(fetch_url)) {
+                                char fetched_title[256] = {0};
+                                Song temp_songs[MAX_PLAYLIST_ITEMS];
+                                int fetched = fetch_youtube_playlist(fetch_url, temp_songs, MAX_PLAYLIST_ITEMS,
+                                                                     fetched_title, sizeof(fetched_title),
+                                                                     youtube_fetch_progress_callback, status,
+                                                                     get_ytdlp_cmd(&st));
+
+                                if (fetched > 0) {
+                                    // Count new songs (not already in playlist)
+                                    int new_count = 0;
+                                    int old_count = pl->count;
+
+                                    for (int i = 0; i < fetched; i++) {
+                                        bool exists = false;
+                                        for (int j = 0; j < old_count; j++) {
+                                            if (pl->items[j].video_id && temp_songs[i].video_id &&
+                                                strcmp(pl->items[j].video_id, temp_songs[i].video_id) == 0) {
+                                                exists = true;
+                                                break;
+                                            }
+                                        }
+
+                                        if (!exists && pl->count < MAX_PLAYLIST_ITEMS) {
+                                            // Add new song
+                                            int idx = pl->count;
+                                            pl->items[idx].title = temp_songs[i].title;
+                                            pl->items[idx].video_id = temp_songs[i].video_id;
+                                            pl->items[idx].url = temp_songs[i].url;
+                                            pl->items[idx].duration = temp_songs[i].duration;
+                                            pl->count++;
+                                            new_count++;
+                                            // Clear pointers so they won't be freed below
+                                            temp_songs[i].title = NULL;
+                                            temp_songs[i].video_id = NULL;
+                                            temp_songs[i].url = NULL;
+                                        }
+                                    }
+
+                                    // Free remaining temp songs
+                                    for (int i = 0; i < fetched; i++) {
+                                        free(temp_songs[i].title);
+                                        free(temp_songs[i].video_id);
+                                        free(temp_songs[i].url);
+                                    }
+
+                                    if (new_count > 0) {
+                                        save_playlist(&st, st.current_playlist_idx);
+                                        snprintf(status, sizeof(status), "Added %d new songs", new_count);
+                                    } else {
+                                        snprintf(status, sizeof(status), "Playlist is up to date");
+                                    }
+                                } else {
+                                    snprintf(status, sizeof(status), "Failed to fetch playlist");
+                                }
+                            } else if (len > 0) {
+                                snprintf(status, sizeof(status), "Invalid YouTube playlist URL");
+                            } else {
+                                snprintf(status, sizeof(status), "Sync cancelled");
+                            }
+                        } else {
+                            snprintf(status, sizeof(status), "Not a YouTube playlist");
+                        }
+                        break;
+
                     case 'x':
                         if (st.playing_index >= 0) {
                             mpv_stop_playback();
