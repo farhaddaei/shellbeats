@@ -16,6 +16,7 @@ Sorry for the delay. Unfortunately, I only had time over the weekend to work on 
 - Added **Jump to time** (`t` key): input `mm:ss` to jump to specific position in track.
 - Added **Playlist rename** (`e` key): rename playlists including their download folders.
 - Added **Remember Session**: optional setting to restore your last search/playlist on next startup. Caches search results locally.
+- Added **YouTube playlist sync** (`u` key): update imported YouTube playlists with new songs added on YouTube.
 - New Settings options: Seek Step (configurable), Remember Session (toggle), Shuffle Mode (toggle).
 
 **v0.5**
